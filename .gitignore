@@ -61,3 +61,7 @@ Vent
 .claude/codebase.json
 .claude/CODEBASE.md
 .claude/.agentifind-checksum
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db

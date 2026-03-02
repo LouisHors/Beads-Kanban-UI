@@ -4,6 +4,7 @@
 //! and provides API endpoints for backend functionality.
 
 mod db;
+mod dolt;
 mod routes;
 
 use axum::{
@@ -13,15 +14,15 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
-use rust_embed::Embed;
 use std::env;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+use rust_embed::RustEmbed;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 /// Embedded static files from the Next.js build output.
-#[derive(Embed)]
+#[derive(RustEmbed)]
 #[folder = "../out/"]
 struct Assets;
 
@@ -30,7 +31,7 @@ async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
 
     // Try the exact path first
-    if let Some(content) = Assets::get(path) {
+    if let Some(content) = <Assets as RustEmbed>::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         return Response::builder()
             .status(StatusCode::OK)
@@ -41,7 +42,7 @@ async fn serve_static(req: Request<Body>) -> impl IntoResponse {
 
     // Try with .html extension (for Next.js static export)
     let html_path = format!("{}.html", path);
-    if let Some(content) = Assets::get(&html_path) {
+    if let Some(content) = <Assets as RustEmbed>::get(&html_path) {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html")
@@ -55,7 +56,7 @@ async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     } else {
         format!("{}/index.html", path)
     };
-    if let Some(content) = Assets::get(&index_path) {
+    if let Some(content) = <Assets as RustEmbed>::get(&index_path) {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html")
@@ -64,7 +65,7 @@ async fn serve_static(req: Request<Body>) -> impl IntoResponse {
     }
 
     // Fallback to root index.html for SPA client-side routing
-    if let Some(content) = Assets::get("index.html") {
+    if let Some(content) = <Assets as RustEmbed>::get("index.html") {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html")

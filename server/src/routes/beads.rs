@@ -15,6 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::validate_path_security;
+use crate::dolt;
 
 /// Resolves the correct path to `issues.jsonl` for a project.
 ///
@@ -68,7 +69,7 @@ pub struct BeadsParams {
 }
 
 /// A dependency relationship in the JSONL file.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Dependency {
     depends_on_id: String,
     #[serde(rename = "type")]
@@ -76,7 +77,7 @@ struct Dependency {
 }
 
 /// A single bead/issue from the JSONL file.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bead {
     pub id: String,
     pub title: String,
@@ -116,7 +117,7 @@ pub struct Bead {
 }
 
 /// A comment on a bead.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub id: i64,
     pub issue_id: String,
@@ -129,6 +130,137 @@ pub struct Comment {
 ///
 /// Reads the .beads/issues.jsonl file from the specified project path
 /// and returns an array of beads.
+/// Load beads from Dolt database backend.
+fn load_beads_from_dolt_backend(project_path: &Path) -> Result<Vec<Bead>, String> {
+    let (issues, dependencies, comments) = dolt::load_beads_from_dolt(project_path)?;
+    
+    // Build comments map: issue_id -> Vec<Comment>
+    let mut comments_map: HashMap<String, Vec<Comment>> = HashMap::new();
+    for c in comments {
+        comments_map.entry(c.issue_id.clone())
+            .or_default()
+            .push(Comment {
+                id: c.id,
+                issue_id: c.issue_id,
+                author: c.author,
+                text: c.text,
+                created_at: c.created_at,
+            });
+    }
+    
+    // Build dependencies map: issue_id -> Vec<Dependency>
+    let mut deps_map: HashMap<String, Vec<Dependency>> = HashMap::new();
+    for d in dependencies {
+        deps_map.entry(d.issue_id.clone())
+            .or_default()
+            .push(Dependency {
+                depends_on_id: d.depends_on_id,
+                dep_type: d.dep_type,
+            });
+    }
+    
+    // Convert issues to beads
+    let mut beads: Vec<Bead> = issues.into_iter().map(|issue| {
+        let comments = comments_map.get(&issue.id).cloned();
+        let dependencies = deps_map.get(&issue.id).cloned();
+        
+        Bead {
+            id: issue.id,
+            title: issue.title,
+            description: issue.description,
+            status: issue.status,
+            priority: issue.priority,
+            issue_type: issue.issue_type,
+            owner: issue.owner,
+            created_at: issue.created_at,
+            created_by: issue.created_by,
+            updated_at: issue.updated_at,
+            closed_at: issue.closed_at,
+            close_reason: None,
+            comments,
+            parent_id: None,
+            children: None,
+            design_doc: issue.design,
+            deps: None,
+            relates_to: None,
+            dependencies,
+        }
+    }).collect();
+    
+    // Apply post-processing for parent-child relationships
+    apply_bead_post_processing(&mut beads);
+    
+    Ok(beads)
+}
+
+/// Apply post-processing to beads: parent-child relationships, relates-to, etc.
+fn apply_bead_post_processing(beads: &mut Vec<Bead>) {
+    let mut parent_to_children: HashMap<String, Vec<String>> = HashMap::new();
+    
+    // First pass: Extract parent-child relationships from explicit dependencies
+    for bead in beads.iter_mut() {
+        if let Some(deps) = &bead.dependencies {
+            for dep in deps {
+                if dep.dep_type == "parent-child" {
+                    bead.parent_id = Some(dep.depends_on_id.clone());
+                    parent_to_children
+                        .entry(dep.depends_on_id.clone())
+                        .or_default()
+                        .push(bead.id.clone());
+                }
+            }
+        }
+    }
+    
+    // Second pass: Infer parent-child from ID patterns
+    let bead_ids: std::collections::HashSet<String> = beads.iter().map(|b| b.id.clone()).collect();
+    let inferred: Vec<(String, String)> = beads
+        .iter()
+        .filter_map(|bead| {
+            if bead.parent_id.is_some() {
+                return None;
+            }
+            let dot_pos = bead.id.rfind('.')?;
+            let potential_parent = &bead.id[..dot_pos];
+            if bead_ids.contains(potential_parent) {
+                Some((bead.id.clone(), potential_parent.to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    for (child_id, inferred_parent_id) in &inferred {
+        if let Some(bead) = beads.iter_mut().find(|b| &b.id == child_id) {
+            bead.parent_id = Some(inferred_parent_id.clone());
+        }
+        parent_to_children
+            .entry(inferred_parent_id.clone())
+            .or_default()
+            .push(child_id.clone());
+    }
+    
+    // Third pass: Set children on parent beads
+    for bead in beads.iter_mut() {
+        if let Some(children) = parent_to_children.get(&bead.id) {
+            bead.children = Some(children.clone());
+        }
+    }
+    
+    // Fourth pass: Extract relates-to dependencies
+    for bead in beads.iter_mut() {
+        if let Some(deps) = &bead.dependencies {
+            let related: Vec<String> = deps
+                .iter()
+                .filter(|dep| dep.dep_type == "relates-to")
+                .map(|dep| dep.depends_on_id.clone())
+                .collect();
+            if !related.is_empty() {
+                bead.relates_to = Some(related);
+            }
+        }
+    }
+}
 pub async fn read_beads(Query(params): Query<BeadsParams>) -> impl IntoResponse {
     let project_path = PathBuf::from(&params.path);
 
@@ -139,6 +271,21 @@ pub async fn read_beads(Query(params): Query<BeadsParams>) -> impl IntoResponse 
             Json(serde_json::json!({ "error": e })),
         );
     }
+
+    // Detect backend type (dolt vs jsonl)
+    let backend = dolt::detect_backend(&project_path);
+    
+    if backend == dolt::BackendType::Dolt {
+        tracing::info!("Using Dolt backend for project: {:?}", project_path);
+        match load_beads_from_dolt_backend(&project_path) {
+            Ok(beads) => return (StatusCode::OK, Json(serde_json::json!({ "beads": beads }))),
+            Err(e) => {
+                tracing::warn!("Dolt backend failed, falling back to JSONL: {}", e);
+                // Fall through to JSONL parsing
+            }
+        }
+    }
+
 
     let issues_path = resolve_issues_path(&project_path);
 
